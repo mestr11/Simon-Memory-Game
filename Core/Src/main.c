@@ -18,7 +18,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f401xe.h"
+#include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_def.h"
+#include "stm32f4xx_hal_gpio.h"
 #include "stm32f4xx_hal_tim.h"
 #include "stm32f4xx_hal_uart.h"
 
@@ -32,23 +35,47 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum {
-  GREEN = GPIO_PIN_5,
-  YELLOW = GPIO_PIN_6,
-  BLUE = GPIO_PIN_11,
-  RED = GPIO_PIN_12
-} Color;
+  IDLE,
+  DISPLAY_SEQUENCE,
+  USER_INPUT,
+  GAME_OVER,
+} GameState;
 
 typedef enum {
-  GREEN_NOTE = 349,
-  YELLOW_NOTE = 329,
-  BLUE_NOTE = 293,
-  RED_NOTE = 261
-} Note;
+  RED = 0,
+  BLUE,
+  YELLOW,
+  GREEN,
+  NONE
+} ColorIndex;
+
+typedef struct {
+  uint16_t button_pin;
+  uint16_t light_pin;
+  uint16_t note;
+  uint8_t toggled;
+} Color;
+
+Color colors[] = {
+  {GPIO_PIN_3, GPIO_PIN_12, (uint16_t) 261, 0},
+  {GPIO_PIN_2, GPIO_PIN_11, (uint16_t) 293, 0},
+  {GPIO_PIN_1, GPIO_PIN_6, (uint16_t) 329, 0},
+  {GPIO_PIN_0, GPIO_PIN_5, (uint16_t) 349, 0},
+};
+
+typedef struct {
+  GameState state;
+  uint8_t sequence[64];
+  uint8_t sequence_length;
+  uint8_t input_index;
+} GameContext;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define GAME_MAX_DELAY 500
+#define GAME_DELAY_SHORT 200
+#define DEBOUNCE_TIME 50
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,18 +90,8 @@ TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint8_t game_started = 0;
-uint8_t display_sequence = 0;
-
-Color sequence[32];
-uint8_t sequence_length = 0;
-uint8_t sequence_index = 0;
-
-uint16_t current_button = 0;
-
-uint16_t current_note = 0;
-uint8_t note_playing = 0;
-uint8_t fail_counter = 0;
+GameContext game;
+uint32_t rng = 198273;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,17 +101,14 @@ static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-void start_game();
-void add_to_sequence();
-void clear_colors();
-
-void play_note(uint16_t frequency);
-void stop_note();
-
-uint8_t handle_buttons();
-uint16_t map_to_color(uint8_t n);
-uint16_t get_random_color(uint8_t n);
-uint16_t color_to_frequency(uint8_t n);
+void game_init(void);
+void game_step(void);
+void play_tone(uint16_t freq);
+void stop_tone(void);
+void toggle_color(Color *color);
+void set_color(Color *color, uint8_t state);
+uint8_t get_next_random_color(void);
+uint8_t get_button_input(uint8_t reset);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -110,8 +124,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  char msg[50];
-  uint16_t previous = 0;
+  char msg[64];
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -138,6 +151,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
   HAL_TIM_Base_Start_IT(&htim2);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_11|GPIO_PIN_12, GPIO_PIN_RESET);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -147,71 +162,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
-      HAL_Delay(50);
-      if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
-        start_game();
-      }
-    }
-    if (!game_started) 
-      continue;
-
-    if (display_sequence) {
-      int len = sprintf(msg, "Displaying sequence of length %d\r\n", sequence_length);
-      HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);  
-
-      clear_colors();
-      for (int i = 0; i < sequence_length; i++) {
-        HAL_GPIO_WritePin(GPIOA, sequence[i], GPIO_PIN_SET);
-        current_note = color_to_frequency(sequence[i]);
-        note_playing = 1;
-        HAL_Delay(500);
-        note_playing = 0;
-        HAL_GPIO_WritePin(GPIOA, sequence[i], GPIO_PIN_RESET);
-        HAL_Delay(200);
-      }
-      display_sequence = 0;
-      continue;
-    }
-
-    int new_button_pressed = handle_buttons();
-
-    if (new_button_pressed) {
-      uint16_t selected_color = map_to_color(current_button);      
-      if (sequence[sequence_index] == selected_color) {
-        HAL_GPIO_WritePin(GPIOA, selected_color, GPIO_PIN_SET);
-        previous = selected_color;
-        sequence_index++;
-
-        current_note = color_to_frequency(selected_color);
-        note_playing = 1;
-      }
-      else {
-        uint16_t correct_pin = sequence[sequence_index];
-        // Play fail tone
-        note_playing = -1;
-        for (int i = 0; i < 3; i++) {
-          HAL_GPIO_WritePin(GPIOA, correct_pin, GPIO_PIN_SET);
-          HAL_Delay(200);
-          HAL_GPIO_WritePin(GPIOA, correct_pin, GPIO_PIN_RESET);
-          HAL_Delay(200);
-        }
-        note_playing = 0;
-        game_started = 0;
-      }
-    }
-    else if (current_button == 0) {
-      HAL_GPIO_WritePin(GPIOA, previous, GPIO_PIN_RESET);
-      previous = current_button;
-
-      note_playing = 0;
-    }
+    game_step();
     
-    if (current_button == 0 && sequence_index >= sequence_length) {
-      add_to_sequence();
-      sequence_index = 0;
-      display_sequence = 1;
-      HAL_Delay(500);
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
+      HAL_Delay(DEBOUNCE_TIME);
+      if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
+        while (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET);
+        game_init();
+      }
     }
   }
   /* USER CODE END 3 */
@@ -446,166 +404,178 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM2) {
-    if (note_playing == 1)
-      play_note(current_note);
-    
-    // Check for loss
-    else if (note_playing == -1) {
-      uint16_t FREQ_1 = 440;
-      uint16_t FREQ_2 = 446;
 
-      if (fail_counter == 0)
-        current_note = (current_note == FREQ_2) ? FREQ_1 : FREQ_2;
-
-      play_note(current_note);
-      fail_counter++;
-    }
-    else {
-      stop_note();
-    }
-  }
+uint8_t get_next_random_color() {
+  rng = rng * 102934871 + 39165;
+  return (uint8_t)((rng >> 16) & 0x03);
 }
 
-void start_game() {
-  sequence_length = 0;
-  sequence_index = 0;
-
-  add_to_sequence();
-  clear_colors();
-
-  display_sequence = 1;
-  game_started = 1;
-}
-
-void add_to_sequence() {
-  int next = get_random_color(HAL_GetTick());
-  sequence[sequence_length] = next;
-  sequence_length++;
-}
-
-void clear_colors() {
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
-}
-
-int handle_buttons() {
-    // 1. Check if a tracked button is actively being held down
-    if (current_button != 0 && HAL_GPIO_ReadPin(GPIOC, current_button) == GPIO_PIN_RESET) {
-        // Current button is still being pressed, skip scanning others.
-        return 0;
-    } 
-    // 2. Handle the exact moment the tracked button is released
-    else if (current_button != 0) {
-        HAL_Delay(50); // Clean up the release edge mechanical bouncing
-        
-        // Double check that it's actually fully released before resetting
-        if (HAL_GPIO_ReadPin(GPIOC, current_button) == GPIO_PIN_SET) {
-            current_button = 0;
-            return 0; 
-        }
-    }
-
-    // 3. Scan for brand new button presses (Only reached if current_button == 0)
-    
-    // GREEN
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_RESET) {
-        HAL_Delay(50); // Debounce the new press edge
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_RESET) {
-            current_button = GPIO_PIN_0;
-            return 1;
-        }
-    }
-    
-    // YELLOW
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) {
-        HAL_Delay(50);
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) {
-            current_button = GPIO_PIN_1;
-            return 1;
-        }
-    }
-    
-    // BLUE
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2) == GPIO_PIN_RESET) {
-        HAL_Delay(50);
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2) == GPIO_PIN_RESET) {
-            current_button = GPIO_PIN_2;
-            return 1;
-        }
-    }
-    
-    // RED
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3) == GPIO_PIN_RESET) {
-        HAL_Delay(50);
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3) == GPIO_PIN_RESET) {
-            current_button = GPIO_PIN_3;
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-void play_note(uint16_t frequency) {
-  // 1,000,00 HZ set by prescaler=83
-  uint32_t period = (1000000 / frequency) - 1;
+void play_tone(uint16_t freq) {
+  uint32_t period = (1000000 / freq) - 1; // 1,000,00 HZ set by prescaler=83
   __HAL_TIM_SET_AUTORELOAD(&htim3, period);
-
-  uint32_t compare = period / 4;
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, compare);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, period >> 2);
 }
 
-void stop_note() {
+void stop_tone() {
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 0);
 }
 
-uint16_t color_to_frequency(int color) {
-  switch (color) {
-    case GREEN:
-      return GREEN_NOTE;
-    case YELLOW:
-      return YELLOW_NOTE;
-    case BLUE:
-      return BLUE_NOTE;
-    case RED:
-      return RED_NOTE;
+void toggle_color(Color *color) {
+  if (!color->toggled) {
+    HAL_GPIO_WritePin(GPIOA, color->light_pin, GPIO_PIN_SET);
+    play_tone(color->note);
+    color->toggled = 1;
   }
-  return 0; 
+  else{
+    HAL_GPIO_WritePin(GPIOA, color->light_pin, GPIO_PIN_RESET);
+    stop_tone();
+    color->toggled = 0;
+  }
 }
 
-uint16_t map_to_color(int n) {
-  switch (n) {
-    case 1:
-      return GPIO_PIN_5;
-    case 2:
-      return GPIO_PIN_6;
-    case 4:
-      return GPIO_PIN_11;
-    case 8:
-      return GPIO_PIN_12;
-  }
-
-  return 0;
+void set_color(Color *color, uint8_t state) {
+  color->toggled = !state;
+  toggle_color(color);
 }
 
-uint16_t get_random_color(int n) {
-  n %= 4;
-  switch (n) {
-    case 0:
-      return GPIO_PIN_5;
-    case 1:
-      return GPIO_PIN_6;
-    case 2:
-      return GPIO_PIN_11;
-    case 3:
-      return GPIO_PIN_12;
-  }
-  return 0;
+void game_init() {
+  rng = HAL_GetTick();
+
+  game.sequence_length = 0;
+  game.input_index = 0;
+  game.state = DISPLAY_SEQUENCE;
+
+  game.sequence[0] = get_next_random_color();
+  game.sequence_length = 1;
+
+  get_button_input(1); // Reset static variables
+
+  char msg[64];
+  int len = sprintf(msg, "Game started.\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);
 }
+
+void game_step() {
+  switch (game.state) {
+    case DISPLAY_SEQUENCE:
+
+      // 1. Check if sequence is complete.
+      if (game.input_index >= game.sequence_length) {
+        game.state = USER_INPUT;
+        game.input_index = 0;
+        return;
+      }
+
+      // 2. Calculate sequence delay.
+      uint32_t delay_modifier = (game.sequence_length >> 2) * 50;
+      uint32_t sequence_delay = GAME_MAX_DELAY - delay_modifier;
+
+      // 3. Display current sequence step.
+      Color *current_color = &colors[game.sequence[game.input_index]];
+      toggle_color(current_color);
+      HAL_Delay(sequence_delay);
+      toggle_color(current_color);
+      HAL_Delay(100);
+
+      // 4. Go to next color in sequence.
+      game.input_index++;
+      break;
+  
+    case USER_INPUT: {
+      static ColorIndex last_color = NONE;
+
+      // 1. Check if sequence is complete
+      if (game.input_index >= game.sequence_length) {
+        game.sequence[game.sequence_length] = get_next_random_color();
+        game.sequence_length++;
+        game.input_index = 0;
+        game.state = DISPLAY_SEQUENCE;
+        last_color = NONE;
+
+        HAL_Delay(250); // Wait before displaying sequence
+        return;
+      }
+
+      // 2. Get button pressed by user
+      ColorIndex color = get_button_input(0);
+      if (color == last_color)
+        return;
+
+      // 3. Case 1: Button was released (COLOR -> NONE), continue sequence.
+      if (last_color != NONE && color == NONE) {
+        set_color(&colors[last_color], 0);
+        game.input_index++;
+      }
+      // 4. Case 2: Button was pressed (NONE -> COLOR).
+      else if (last_color == NONE && color != NONE) {
+
+        // 5 If button does not match sequence, fail IMMEDIATELY.
+        if (color != game.sequence[game.input_index]) {
+          game.state = GAME_OVER;
+          last_color = NONE;
+          return;
+        }
+        // 6. Otherwise, display input.
+        else {
+          set_color(&colors[color], 1);
+        }
+      }
+
+      // 7. Set last button
+      last_color = color;
+      break;
+    }
+    case GAME_OVER:
+      play_tone(130);
+      Color *correct_color = &colors[game.sequence[game.input_index]];
+
+      for (int i = 0; i < 6; i ++) {
+        HAL_GPIO_TogglePin(GPIOA, correct_color->light_pin);
+        HAL_Delay(250);
+      }
+      stop_tone();
+      game.state = IDLE;
+      break;
+    case IDLE:
+      break;
+  }
+}
+
+uint8_t get_button_input(uint8_t reset) {
+  static uint8_t stable_button = NONE;
+  static uint8_t candidate_button = NONE;
+  static uint32_t last_debounce_time = 0;
+
+  uint8_t current_button = NONE;
+
+  // Clear static variables on game start
+  if (reset) {
+    stable_button = NONE;
+    candidate_button = NONE;
+    last_debounce_time = 0;
+    return NONE;
+  }
+
+  // Read buttons
+  for (uint8_t i = 0; i < 4; i++) {
+    if (HAL_GPIO_ReadPin(GPIOC, colors[i].button_pin) == GPIO_PIN_RESET) {
+      current_button = i;
+      break;
+    }
+  }
+
+  if (current_button != candidate_button) {
+    candidate_button = current_button;
+    last_debounce_time = HAL_GetTick();
+  }
+
+  if ((HAL_GetTick() - last_debounce_time) >= DEBOUNCE_TIME) {
+    stable_button = candidate_button;
+  }
+
+  return stable_button;
+}
+
 
 /* USER CODE END 4 */
 
