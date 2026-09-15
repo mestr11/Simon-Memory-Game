@@ -3,7 +3,7 @@ A recreation of the classic simon memory game using an STM32 microcontroller
 
 ## Preview
 
-https://youtube.com/shorts/BJGnYqzJwhc?si=O_7QyePAiZKkpelp
+[Watch the demo](https://youtube.com/BJGnYqzJwhc?si=O_7QyePAiZKkpelp)
 
 ## Overview
 
